@@ -58,8 +58,26 @@ export const sendEmail: Tool = {
   }
 };
 
+export const createCrmNote: Tool = {
+  name: 'create_crm_note',
+  description: 'Create a note on a customer record in the CRM using their Stripe customer ID.',
+  parameters: {
+    type: 'object',
+    properties: {
+      customerId: { type: 'string', description: 'Stripe customer ID (e.g. cus_123)' },
+      note: { type: 'string', description: 'Note content to attach to the customer record' },
+    },
+    required: ['customerId', 'note'],
+  },
+  execute: async ({ customerId, note }) => {
+    console.log(`[Mock] Creating CRM note for ${customerId}: "${note}"`);
+    return { success: true, noteId: 'note_456', customerId };
+  },
+};
+
 export const toolLibrary: Record<string, Tool> = {
   find_stripe_customer: findStripeCustomer,
   send_slack_message: sendSlackMessage,
   send_email: sendEmail,
+  create_crm_note: createCrmNote,
 };
