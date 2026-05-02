@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { WorkflowStatus } from '../generated/client';
 import { prisma } from '../index';
 import { planWorkflow } from '../planner.js';
+import { startWorkflowExecution } from '../executor.js';
 
 const router = Router();
 
@@ -54,6 +55,9 @@ router.post('/', async (req, res) => {
         where: { id: workflow.id },
         data: { status: WorkflowStatus.EXECUTING },
       });
+
+      // Start execution asynchronously
+      startWorkflowExecution(workflow.id);
 
       res.json({
         id: workflow.id,
@@ -131,6 +135,9 @@ router.post('/:id/clarify', async (req, res) => {
         clarificationAnswer: answer,
       },
     });
+
+    // Start execution asynchronously
+    startWorkflowExecution(id);
 
     res.json({
       id,
