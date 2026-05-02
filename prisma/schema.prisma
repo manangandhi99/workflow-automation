@@ -1,0 +1,54 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum WorkflowStatus {
+  PENDING
+  PLANNING
+  EXECUTING
+  COMPLETED
+  FAILED
+}
+
+enum StepStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+model Workflow {
+  id        String   @id @default(cuid())
+  goal      String
+  status    WorkflowStatus @default(PENDING)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  steps WorkflowStep[]
+
+  @@map("workflows")
+}
+
+model WorkflowStep {
+  id         String   @id @default(cuid())
+  workflowId String
+  stepOrder  Int
+  toolName   String
+  inputParams Json?
+  outputData Json?
+  status     StepStatus @default(PENDING)
+  thought    String?
+
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@map("workflow_steps")
+}
