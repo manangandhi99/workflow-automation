@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { WorkflowStatus } from '../generated/client';
 import { prisma } from '../index';
+import { planWorkflow } from '../planner.js';
 
 const router = Router();
 
@@ -15,16 +16,133 @@ router.post('/', async (req, res) => {
     const workflow = await prisma.workflow.create({
       data: {
         goal,
-        status: WorkflowStatus.PENDING,
+        status: WorkflowStatus.PLANNING,
       },
     });
 
-    // TODO: Start planning asynchronously
+    try {
+      const result = await planWorkflow(goal);
 
-    res.json({ id: workflow.id });
+      if (result.decision === 'clarification') {
+        await prisma.workflow.update({
+          where: { id: workflow.id },
+          data: {
+            status: WorkflowStatus.NEEDS_CLARIFICATION,
+            clarificationQuestion: result.question,
+          },
+        });
+
+        return res.json({
+          id: workflow.id,
+          status: WorkflowStatus.NEEDS_CLARIFICATION,
+          clarificationQuestion: result.question,
+        });
+      }
+
+      const plan = result.plan;
+      await prisma.workflowStep.createMany({
+        data: plan.steps.map((step, index) => ({
+          workflowId: workflow.id,
+          stepOrder: index + 1,
+          toolName: step.toolName,
+          inputParams: step.inputParams as any,
+          thought: step.thought,
+        })),
+      });
+
+      await prisma.workflow.update({
+        where: { id: workflow.id },
+        data: { status: WorkflowStatus.EXECUTING },
+      });
+
+      res.json({
+        id: workflow.id,
+        message: 'Workflow created and planned successfully',
+        steps: plan.steps.length,
+      });
+    } catch (planningError) {
+      await prisma.workflow.update({
+        where: { id: workflow.id },
+        data: { status: WorkflowStatus.FAILED },
+      });
+      throw planningError;
+    }
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Workflow creation failed:', error);
+    res.status(500).json({
+      error: 'Failed to create workflow',
+      details: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+// POST /api/workflows/:id/clarify - Submit clarification answer
+router.post('/:id/clarify', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { answer } = req.body;
+
+    if (!answer) {
+      return res.status(400).json({ error: 'Clarification answer is required' });
+    }
+
+    const workflow = await prisma.workflow.findUnique({
+      where: { id },
+    });
+
+    if (!workflow) {
+      return res.status(404).json({ error: 'Workflow not found' });
+    }
+
+    const result = await planWorkflow(workflow.goal, answer);
+
+    if (result.decision === 'clarification') {
+      await prisma.workflow.update({
+        where: { id },
+        data: {
+          clarificationQuestion: result.question,
+          clarificationAnswer: answer,
+          status: WorkflowStatus.NEEDS_CLARIFICATION,
+        },
+      });
+
+      return res.json({
+        id,
+        status: WorkflowStatus.NEEDS_CLARIFICATION,
+        clarificationQuestion: result.question,
+      });
+    }
+
+    const plan = result.plan;
+    await prisma.workflowStep.createMany({
+      data: plan.steps.map((step, index) => ({
+        workflowId: id,
+        stepOrder: index + 1,
+        toolName: step.toolName,
+        inputParams: step.inputParams as any,
+        thought: step.thought,
+      })),
+    });
+
+    await prisma.workflow.update({
+      where: { id },
+      data: {
+        status: WorkflowStatus.EXECUTING,
+        clarificationAnswer: answer,
+      },
+    });
+
+    res.json({
+      id,
+      message: 'Workflow clarified and planned successfully',
+      steps: plan.steps.length,
+    });
+  } catch (error) {
+    console.error('Clarification failed:', error);
+    res.status(500).json({
+      error: 'Failed to process clarification',
+      details: error instanceof Error ? error.message : 'Unknown error',
+    });
   }
 });
 

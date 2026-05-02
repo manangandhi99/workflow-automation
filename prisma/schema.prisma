@@ -15,6 +15,7 @@ datasource db {
 enum WorkflowStatus {
   PENDING
   PLANNING
+  NEEDS_CLARIFICATION
   EXECUTING
   COMPLETED
   FAILED
@@ -27,11 +28,13 @@ enum StepStatus {
 }
 
 model Workflow {
-  id        String   @id @default(cuid())
-  goal      String
-  status    WorkflowStatus @default(PENDING)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                    String   @id @default(cuid())
+  goal                  String
+  status                WorkflowStatus @default(PENDING)
+  clarificationQuestion String?
+  clarificationAnswer   String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 
   steps WorkflowStep[]
 
