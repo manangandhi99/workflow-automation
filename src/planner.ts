@@ -80,14 +80,19 @@ async function runPlannerOnce(
   const parsed = JSON.parse(content);
   const validated = PlannerResponseSchema.parse(parsed);
 
-  if (validated.decision === 'plan' && !validated.steps) {
-    throw new Error('Planner returned plan decision without steps');
-  }
-  if (validated.decision === 'clarification' && !validated.question) {
-    throw new Error('Planner returned clarification decision without question');
+  if (validated.decision === 'plan') {
+    const steps = validated.steps;
+    if (!steps || steps.length === 0) {
+      throw new Error('Planner returned plan decision without steps');
+    }
+    return { decision: 'plan' as const, plan: { steps } };
   }
 
-  return validated as PlannerResult;
+  const question = validated.question;
+  if (!question) {
+    throw new Error('Planner returned clarification decision without question');
+  }
+  return { decision: 'clarification' as const, question };
 }
 
 export async function planWorkflow(
@@ -109,7 +114,7 @@ export async function planWorkflow(
     }
 
     const plan = result.plan;
-    const review = await validatePlan(goal, plan, tools);
+    const review = validatePlan(goal, plan, tools);
 
     if (review.status === 'VALID') {
       return { decision: 'plan', plan };

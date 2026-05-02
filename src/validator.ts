@@ -1,61 +1,54 @@
-import OpenAI from 'openai';
-import { z } from 'zod';
 import { WorkflowPlan } from './types.js';
 import { Tool } from './tools.js';
 
-const PlanReviewSchema = z.object({
-  status: z.enum(['VALID', 'INVALID']),
-  errors: z.array(z.string()).optional(),
-});
-
-export type PlanReviewResult = z.infer<typeof PlanReviewSchema>;
-
-async function getOpenAIClient() {
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+export interface PlanReviewResult {
+  status: 'VALID' | 'INVALID';
+  errors?: string[];
 }
 
-export async function validatePlan(goal: string, plan: WorkflowPlan, availableTools: Tool[]) {
-  const openai = await getOpenAIClient();
-  const toolList = availableTools
-    .map((tool) => `- ${tool.name}: ${tool.description}
-  Parameters: ${JSON.stringify(tool.parameters.properties)}`)
-    .join('\n');
+/**
+ * Deterministic plan validator (the "Validator Agent" in the multi-agent pipeline).
+ *
+ * Checks only concrete, unambiguous errors:
+ *   1. A step uses a toolName that doesn't exist in the retrieved tool set.
+ *   2. A step is missing a parameter marked as "required" by that tool's schema.
+ *      Note: a { "$ref": ... } object satisfies any required param — it's a
+ *      runtime reference to a prior step's output, not a missing value.
+ *
+ * Everything else (parameter values, ordering style, unused tools) is left to
+ * the executor and critic. An LLM-based validator was trialled here but produced
+ * too many false negatives on valid plans — deterministic checks are both faster
+ * and more reliable for this gatekeeping role.
+ */
+export function validatePlan(
+  _goal: string,
+  plan: WorkflowPlan,
+  availableTools: Tool[]
+): PlanReviewResult {
+  const toolMap = new Map(availableTools.map((t) => [t.name, t]));
+  const errors: string[] = [];
 
-  const planJson = JSON.stringify(plan, null, 2);
-  const prompt = `You are a strict QA system for workflow plans. Review the plan below for the goal and the available tools. If the plan is executable and uses only supported tools and required parameters, return {"status":"VALID"}. If there are problems, return {"status":"INVALID","errors":[...]}.
+  plan.steps.forEach((step, i) => {
+    const stepNum = i + 1;
+    const tool = toolMap.get(step.toolName);
 
-Goal: ${goal}
+    if (!tool) {
+      errors.push(`Step ${stepNum}: unknown tool "${step.toolName}"`);
+      return;
+    }
 
-Available tools:
-${toolList}
+    const required: string[] = Array.isArray(tool.parameters.required)
+      ? tool.parameters.required
+      : [];
 
-Plan:
-${planJson}
-
-Review criteria:
-- Does every step use a defined tool?
-- Does each step include required input parameters?
-- Are tool names exact and valid?
-- Does the plan order match dependency needs?
-- If the plan is missing critical steps, identify them.
-
-Output must be valid JSON with status and optional errors.`;
-
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: 'You are a workflow QA system.' },
-      { role: 'user', content: prompt },
-    ],
-    response_format: { type: 'json_object' },
-    temperature: 0,
+    for (const param of required) {
+      if (step.inputParams[param] === undefined) {
+        errors.push(
+          `Step ${stepNum}: missing required parameter "${param}" for tool "${step.toolName}"`
+        );
+      }
+    }
   });
 
-  const content = completion.choices[0]?.message?.content;
-  if (!content) {
-    throw new Error('Validator did not return content');
-  }
-
-  const parsed = JSON.parse(content);
-  return PlanReviewSchema.parse(parsed);
+  return errors.length === 0 ? { status: 'VALID' } : { status: 'INVALID', errors };
 }
