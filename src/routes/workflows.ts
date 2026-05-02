@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { WorkflowStatus } from '../generated/client';
+import { WorkflowStatus, StepStatus } from '../generated/client';
 import { prisma } from '../index';
 import { planWorkflow } from '../planner.js';
 import { startWorkflowExecution } from '../executor.js';
@@ -154,6 +154,62 @@ router.post('/:id/clarify', async (req, res) => {
       error: 'Failed to process clarification',
       details: error instanceof Error ? error.message : 'Unknown error',
     });
+  }
+});
+
+// GET /api/workflows - List all workflows (steps excluded for brevity)
+router.get('/', async (_req, res) => {
+  try {
+    const workflows = await prisma.workflow.findMany({
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        goal: true,
+        status: true,
+        createdAt: true,
+        updatedAt: true,
+        _count: { select: { steps: true } },
+      },
+    });
+    res.json(workflows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/workflows/:id/retry - Re-run a failed workflow from its failed steps
+router.post('/:id/retry', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const workflow = await prisma.workflow.findUnique({ where: { id } });
+
+    if (!workflow) {
+      return res.status(404).json({ error: 'Workflow not found' });
+    }
+
+    if (workflow.status !== WorkflowStatus.FAILED) {
+      return res.status(400).json({ error: 'Only FAILED workflows can be retried' });
+    }
+
+    // Reset failed steps to PENDING; already-succeeded steps are left as-is
+    // so the execution loop skips them and resumes from the failure point
+    await prisma.workflowStep.updateMany({
+      where: { workflowId: id, status: StepStatus.FAILED },
+      data: { status: StepStatus.PENDING, outputData: undefined },
+    });
+
+    await prisma.workflow.update({
+      where: { id },
+      data: { status: WorkflowStatus.EXECUTING },
+    });
+
+    startWorkflowExecution(id);
+
+    res.json({ id, message: 'Workflow retry started' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

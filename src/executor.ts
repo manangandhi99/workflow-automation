@@ -1,14 +1,20 @@
 import { StepStatus, WorkflowStatus } from './generated/client';
 import { prisma } from './index';
 import { toolLibrary } from './tools.js';
-import { resolveStepReferences } from './stepContext.js';
+import { resolveStepReferences, getRecentStepContext } from './stepContext.js';
+import { evaluateStepWithCritic } from './critic.js';
+import { retrieveRelevantTools } from './toolIndex.js';
+import { WorkflowStep } from './types.js';
+
+const MAX_RECOVERY_ATTEMPTS = 5;
+const STEP_CONTEXT_LIMIT = parseInt(process.env.STEP_CONTEXT_LIMIT ?? '5', 10);
 
 /**
  * Execute a single workflow step:
  * 1. Fetch the step from the database
- * 2. Look up the tool in the tool library
- * 3. Run the tool with the input parameters
- * 4. Store the output and mark as SUCCESS or FAILED
+ * 2. Resolve any $ref references in inputParams against prior step outputs
+ * 3. Look up the tool in the tool library
+ * 4. Run the tool, store output, mark SUCCESS or FAILED
  */
 export async function executeStep(stepId: string): Promise<void> {
   const step = await prisma.workflowStep.findUnique({
@@ -68,51 +74,126 @@ export async function executeStep(stepId: string): Promise<void> {
 }
 
 /**
- * Execute all pending steps in a workflow, in order.
- * This is the main execution loop:
- * 1. Fetch the workflow
- * 2. Loop: fetch next PENDING step by step_order
- * 3. Execute each step
- * 4. Update workflow status to COMPLETED or FAILED
+ * Shift all remaining PENDING steps above afterOrder up by steps.length,
+ * then insert the recovery steps in the gap.
  *
- * Note: In production, this would run in a background worker (BullMQ, Temporal, etc.)
- * to avoid blocking the API thread.
+ * Example: original orders [1, 2, 3], afterOrder=1, 2 recovery steps →
+ *   original step 2 → order 4, original step 3 → order 5
+ *   recovery steps inserted at orders 2, 3
  */
-export async function executeWorkflow(workflowId: string): Promise<void> {
-  const workflow = await prisma.workflow.findUnique({
-    where: { id: workflowId },
-    include: { steps: true },
+async function insertRecoverySteps(
+  workflowId: string,
+  afterOrder: number,
+  steps: WorkflowStep[]
+): Promise<void> {
+  await prisma.workflowStep.updateMany({
+    where: { workflowId, status: StepStatus.PENDING, stepOrder: { gt: afterOrder } },
+    data: { stepOrder: { increment: steps.length } },
   });
 
-  if (!workflow) {
-    throw new Error(`Workflow not found: ${workflowId}`);
-  }
+  await prisma.workflowStep.createMany({
+    data: steps.map((step, i) => ({
+      workflowId,
+      stepOrder: afterOrder + i + 1,
+      toolName: step.toolName,
+      inputParams: step.inputParams as any,
+      thought: `[Recovery] ${step.thought}`,
+    })),
+  });
+
+  console.log(`[Executor] Inserted ${steps.length} recovery step(s) after order ${afterOrder}`);
+}
+
+/**
+ * Main execution loop with critic-driven self-correction.
+ *
+ * Loop design: re-fetches the next PENDING step each iteration so that
+ * recovery steps inserted mid-run are picked up automatically.
+ *
+ * After every step (success or fail) the Critic LLM evaluates the output.
+ * If it returns RECOVER, new steps are spliced in before any remaining
+ * original steps. Recovery attempts are capped at MAX_RECOVERY_ATTEMPTS
+ * to prevent infinite loops.
+ *
+ * Production note: this loop would live in a background worker (BullMQ,
+ * Temporal) so it doesn't block the API thread. Here it runs as a
+ * fire-and-forget async call.
+ */
+export async function executeWorkflow(workflowId: string): Promise<void> {
+  const workflow = await prisma.workflow.findUnique({ where: { id: workflowId } });
+  if (!workflow) throw new Error(`Workflow not found: ${workflowId}`);
 
   if (workflow.status !== WorkflowStatus.EXECUTING) {
     console.warn(`[Executor] Workflow ${workflowId} is not in EXECUTING state`);
   }
 
-  try {
-    // Get all steps sorted by step_order
-    const steps = workflow.steps.sort((a, b) => a.stepOrder - b.stepOrder);
+  // Retrieve relevant tools once — reused by critic on every step
+  const relevantTools = await retrieveRelevantTools(workflow.goal, 5);
 
-    for (const step of steps) {
-      if (step.status === StepStatus.PENDING) {
-        try {
-          await executeStep(step.id);
-        } catch (error) {
-          // Step already marked as FAILED by executeStep
-          // Continue to mark the workflow as failed
-          await prisma.workflow.update({
-            where: { id: workflowId },
-            data: { status: WorkflowStatus.FAILED },
-          });
-          throw error;
+  let recoveryCount = 0;
+
+  try {
+    while (true) {
+      // Dynamically fetch next pending step each iteration so recovery
+      // steps inserted by the critic are picked up in order
+      const nextStep = await prisma.workflowStep.findFirst({
+        where: { workflowId, status: StepStatus.PENDING },
+        orderBy: { stepOrder: 'asc' },
+      });
+
+      if (!nextStep) break;
+
+      let stepFailed = false;
+      try {
+        await executeStep(nextStep.id);
+      } catch {
+        stepFailed = true;
+      }
+
+      // Fetch the updated step so the critic sees the stored output
+      const completedStep = await prisma.workflowStep.findUnique({
+        where: { id: nextStep.id },
+      });
+
+      // Re-resolve $ref params so the critic sees concrete values, not ref objects
+      const resolvedParams = await resolveStepReferences(
+        (nextStep.inputParams ?? {}) as Record<string, any>,
+        workflowId
+      );
+
+      if (recoveryCount < MAX_RECOVERY_ATTEMPTS) {
+        const recentContext = await getRecentStepContext(workflowId, STEP_CONTEXT_LIMIT);
+
+        const criticResult = await evaluateStepWithCritic({
+          goal: workflow.goal,
+          toolName: nextStep.toolName,
+          inputParams: resolvedParams,
+          outputData: completedStep?.outputData,
+          thought: nextStep.thought ?? '',
+          stepFailed,
+          recentContext,
+          availableTools: relevantTools,
+        });
+
+        console.log(`[Critic] ${criticResult.decision}: ${criticResult.reason}`);
+
+        if (criticResult.decision === 'RECOVER' && criticResult.recoverySteps?.length) {
+          recoveryCount++;
+          await insertRecoverySteps(workflowId, nextStep.stepOrder, criticResult.recoverySteps);
+          continue;
         }
+      }
+
+      // If the step failed and the critic didn't generate a recovery, give up
+      if (stepFailed) {
+        await prisma.workflow.update({
+          where: { id: workflowId },
+          data: { status: WorkflowStatus.FAILED },
+        });
+        throw new Error(`Step ${nextStep.id} (${nextStep.toolName}) failed with no recovery`);
       }
     }
 
-    // All steps completed successfully
     await prisma.workflow.update({
       where: { id: workflowId },
       data: { status: WorkflowStatus.COMPLETED },
@@ -120,18 +201,20 @@ export async function executeWorkflow(workflowId: string): Promise<void> {
 
     console.log(`[Executor] Workflow ${workflowId} completed successfully`);
   } catch (error) {
-    console.error(`[Executor] Workflow ${workflowId} execution failed:`, error);
+    console.error(`[Executor] Workflow ${workflowId} failed:`, error);
+    // Ensure status is FAILED even if the update above was skipped
+    await prisma.workflow
+      .update({ where: { id: workflowId }, data: { status: WorkflowStatus.FAILED } })
+      .catch(() => {});
     throw error;
   }
 }
 
 /**
  * Start execution of a workflow asynchronously (fire and forget).
- * In production, this would queue the task to a distributed worker.
+ * In production this would be: queue.add('execute-workflow', { workflowId })
  */
 export function startWorkflowExecution(workflowId: string): void {
-  // Fire and forget: execute in the background
-  // In production, this would be: queue.add('execute-workflow', { workflowId })
   executeWorkflow(workflowId).catch((error) => {
     console.error(`[Executor] Background execution failed for workflow ${workflowId}:`, error);
   });
