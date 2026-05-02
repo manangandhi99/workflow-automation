@@ -1,6 +1,7 @@
 import { StepStatus, WorkflowStatus } from './generated/client';
 import { prisma } from './index';
 import { toolLibrary } from './tools.js';
+import { resolveStepReferences } from './stepContext.js';
 
 /**
  * Execute a single workflow step:
@@ -37,7 +38,8 @@ export async function executeStep(stepId: string): Promise<void> {
 
   try {
     console.log(`[Executor] Executing step ${step.id} (${step.toolName})`);
-    const inputParams = step.inputParams as Record<string, any>;
+    const rawParams = (step.inputParams ?? {}) as Record<string, any>;
+    const inputParams = await resolveStepReferences(rawParams, step.workflowId);
     const output = await tool.execute(inputParams);
 
     await prisma.workflowStep.update({

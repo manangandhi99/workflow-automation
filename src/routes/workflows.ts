@@ -3,6 +3,9 @@ import { WorkflowStatus } from '../generated/client';
 import { prisma } from '../index';
 import { planWorkflow } from '../planner.js';
 import { startWorkflowExecution } from '../executor.js';
+import { getRecentStepContext } from '../stepContext.js';
+
+const STEP_CONTEXT_LIMIT = parseInt(process.env.STEP_CONTEXT_LIMIT ?? '5', 10);
 
 const router = Router();
 
@@ -98,7 +101,8 @@ router.post('/:id/clarify', async (req, res) => {
       return res.status(404).json({ error: 'Workflow not found' });
     }
 
-    const result = await planWorkflow(workflow.goal, answer);
+    const executionContext = await getRecentStepContext(id, STEP_CONTEXT_LIMIT);
+    const result = await planWorkflow(workflow.goal, answer, executionContext ?? undefined);
 
     if (result.decision === 'clarification') {
       await prisma.workflow.update({
