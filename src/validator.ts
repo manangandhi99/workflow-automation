@@ -16,9 +16,9 @@ export interface PlanReviewResult {
  *      runtime reference to a prior step's output, not a missing value.
  *
  * Everything else (parameter values, ordering style, unused tools) is left to
- * the executor and critic. An LLM-based validator was trialled here but produced
- * too many false negatives on valid plans — deterministic checks are both faster
- * and more reliable for this gatekeeping role.
+ * the executor and critic.
+ * 
+ * Note: A combination of LLM-based planner + deterministic validator to be experimented with if more time, but for now this is a simple rule-based validator that runs synchronously after the planner returns a plan and before execution begins.
  */
 export function validatePlan(
   _goal: string,
